@@ -2,7 +2,7 @@
 
 Scripts that make developer CLIs, libraries and desktop apps trust the Netskope SSL-inspection CA.
 
-> **Fork:** this repository is a fork of [duduke/ssl-configure-scripts](https://github.com/duduke/ssl-configure-scripts), extended for Netskope **Secure Enrollment** (tenant API and local STAgent certificates instead of the legacy org-key flow), with more supported tools and Docker support. This version adds the **silent, non-interactive deployment scripts** described below.
+> **Fork:** this repository is a fork of [ns-toconnor/ssl-configure-script](https://github.com/ns-toconnor/ssl-configure-script), extended for Netskope **Secure Enrollment** (tenant API and local STAgent certificates instead of the legacy org-key flow), with more supported tools and Docker support. This version adds the **silent, non-interactive deployment scripts** described below.
 
 > **Disclaimer:** These scripts are based on publicly available Netskope and individual CLI/tool vendor documentation. They are **not** an official Netskope product and are **not supported by Netskope**. Use at your own risk.
 
