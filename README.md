@@ -1,145 +1,147 @@
-# ssl-configure-scripts
+# netskope-ssl-configure-script
 
-Cross-platform scripts that detect popular CLI tools, libraries, and desktop apps and point them at a Netskope SSL-inspection certificate bundle.
+Scripts that make developer CLIs, libraries and desktop apps trust the Netskope SSL-inspection CA.
 
-> **Origin:** Based on [duduke/ssl-configure-scripts](https://github.com/duduke/ssl-configure-scripts). This fork adds coverage for additional dev tools and switches certificate retrieval to work with **Netskope Secure Enrollment** (tenant API + local STAgent certs) instead of the legacy org-key flow.
+> **Fork:** this repository is a fork of [duduke/ssl-configure-scripts](https://github.com/duduke/ssl-configure-scripts), extended for Netskope **Secure Enrollment** (tenant API and local STAgent certificates instead of the legacy org-key flow), with more supported tools and Docker support. This version adds the **silent, non-interactive deployment scripts** described below.
 
 > **Disclaimer:** These scripts are based on publicly available Netskope and individual CLI/tool vendor documentation. They are **not** an official Netskope product and are **not supported by Netskope**. Use at your own risk.
 
-Each script:
+## What this fork adds
 
-1. Builds a CA bundle at `<certDir>/<certName>` containing the Netskope tenant CA + the Mozilla root bundle (from `curl.se`), plus `<certDir>/netskope-ca.crt` holding just the Netskope chain.
-2. Detects which supported tools are installed.
-3. For each tool, sets the appropriate env var or runs the tool's config command.
-4. If Docker is present, writes ready-to-use container assets to `<certDir>/docker/` (see [Docker](#docker)).
-5. Writes a replay script (`configured_tools.sh` / `configured_tools.bat`) alongside the bundle for silent deployment to other machines.
+- **Works when the tenant CA can't be fetched automatically.** The interactive scripts read the CA from the local Netskope client or download it from the tenant, which fails with *Protect Client Configuration and Resources* or Secure Configuration Services. The new build scripts take a `netskope-cert.pem` you supply.
+- **Silent, non-interactive configuration** for GPO / MDM rollout (Windows PowerShell, macOS/Linux bash): no prompts, no API token, runs as SYSTEM/root or as a normal user.
+- **Machine-wide and per-user coverage** when run elevated: machine-scope variables and every user profile on Windows; every local account's shell files on macOS/Linux, plus a LaunchAgent (macOS) / `environment.d` (Linux) so GUI apps get the variables too.
+- **Configures tools that aren't installed yet.** Environment variables are set for 17 variables covering Python, Azure CLI, AWS CLI, Node.js/npm/Yarn, Git, Go, Ruby, Cargo, gcloud, conda and more, so they work if a tool is installed later. File-based config (Git, Azure Storage Explorer) is skipped and logged when the tool is missing.
+- **Never overwrites existing values blindly.** Custom CA bundles that already trust Netskope are kept; custom bundles that don't are merged with the Netskope CA so internal CAs keep working; stale or previous Netskope paths are replaced. `-Force` / `-f` overrides this.
+- **Detailed troubleshooting log**: timestamped, with the current value, where it was read from, why each setting was kept or changed, bundle hashes, Netskope CA identity and expiry, and a closing summary.
+- **Dry-run mode** (`-DryRun` / `-x`) and meaningful exit codes for MDM reporting.
+- **Hardened bundle build**: validates every certificate, normalises line endings, writes atomically, supports offline builds.
 
-## Scripts
+## Silent deployment (GPO / MDM)
 
-| Platform | Script | Cert source |
+For mass deployment where the tenant CA can't be read from the client or downloaded (*Protect Client Configuration and Resources*, Secure Configuration Services), use the two-step, non-interactive scripts. They never prompt and never need an API token.
+
+| Step | Where it runs | Windows | macOS / Linux |
+| --- | --- | --- | --- |
+| 1. Build the bundle | Once, on an admin machine | [build_cert_bundle_windows.ps1](build_cert_bundle_windows.ps1) | [build_cert_bundle_unix.sh](build_cert_bundle_unix.sh) |
+| 2. Configure tools | Every endpoint (GPO / Intune / Jamf...) | [silent_configure_tools_windows.ps1](silent_configure_tools_windows.ps1) | [silent_configure_tools_unix.sh](silent_configure_tools_unix.sh) |
+
+### Step 1 — build `netskope-cert-bundle.pem`
+
+1. Obtain the Netskope tenant CA yourself and save it as `netskope-cert.pem` **in the same directory as the build script**.
+Note: to obtain the certificate go in your tenant to: Settings -> Manage -> Certificates -> Netskope Certificates and download the Netskope Root Certificate (Remote Users).
+2. Run the build script (no arguments needed):
+   - Windows: `powershell -ExecutionPolicy Bypass -File .\build_cert_bundle_windows.ps1`
+   - macOS/Linux: `./build_cert_bundle_unix.sh`
+3. `netskope-cert-bundle.pem` appears next to it: the Netskope cert(s) first, then the Mozilla root bundle from `curl.se`. Input is validated (every block must parse as a certificate), line endings are normalised, and the output is written atomically.
+
+Offline packaging: pass a local copy of Mozilla's `cacert.pem` (`-MozillaBundlePath` on Windows, `-m` on Unix). Other options: `-Dir`/`-d`, `-InputName`/`-i`, `-OutputName`/`-o`.
+
+### Step 2 — deploy and configure
+
+Package `netskope-cert-bundle.pem` **together with** the silent script and run the script on each endpoint. The script copies the bundle to the directory below (only when missing or different), then configures the tools.
+
+| Item | Windows | macOS / Linux |
 | --- | --- | --- |
-| macOS / Linux | [configure_tools_unix.sh](configure_tools_unix.sh) | Netskope API (Bearer token) or local STAgent certs |
-| Windows | [configure_tools_windows.cmd](configure_tools_windows.cmd) (launcher) + [configure_tools_windows.ps1](configure_tools_windows.ps1) | Netskope API (Bearer token) or local STAgent certs |
-| Any (Python) | [universal_configure_tools.py](universal_configure_tools.py) | Netskope API (Bearer token) or local STAgent certs |
+| Bundle location on endpoint | `C:\netskope\netskope-cert-bundle.pem` | `/usr/local/netskope/netskope-cert-bundle.pem` |
+| Log file | `%PUBLIC%\netskope-ssl-configure-tools.log` (`C:\Users\Public\...`) | macOS: `/Users/Shared/netskope-ssl-configure-tools.log`<br>Linux: `/var/tmp/netskope-ssl-configure-tools.log` |
+| Run as | SYSTEM / admin (machine-wide + all profiles) or a normal user (that user only) | root (all local users) or a normal user (that user only) |
+| Override location | `-CertDir`, `-CertName`, `-LogPath` | `-d`, `-n`, `-l` |
+| Dry run (log only, change nothing) | `-DryRun` | `-x` |
+| Always overwrite existing values | `-Force` | `-f` |
+| Merged bundles (see below) | `C:\netskope\merged\` (elevated) · `%LOCALAPPDATA%\netskope\merged\` (user run) | `/usr/local/netskope/merged/` (root) · `~/.netskope/merged/` (user run) |
 
-`configure_tools_unix.sh` auto-detects macOS vs Linux (via `uname`) and adjusts the shell rc file, STAgent cert path, and app config locations accordingly — it replaces the former separate `configure_tools_mac.sh` / `configure_tools_linux.sh`.
+The macOS/Linux default differs from the interactive script's `~/netskope` because a per-user directory doesn't work for a root-run MDM job that serves every user. The Windows default is unchanged.
 
-If the Netskope client is installed locally, the script will offer to use `nscacert.pem` / `nstenantcert.pem` directly instead of calling the API. Otherwise you need a tenant **Bearer token** with permission to read `/api/v2/services/certs/subordinates`.
+Deployment examples:
 
-## Prerequisites
+- **GPO (Windows)** — Computer Configuration → Windows Settings → Scripts → Startup → PowerShell Scripts; put the `.ps1` and the `.pem` in the same share/folder. Or Intune: Devices → Scripts, "Run this script using the logged on credentials" = **No** (runs as SYSTEM).
+- **Jamf / Intune / Kandji (macOS)** — package the `.sh` and the `.pem` in the same directory (or a `.pkg` that drops them in one place) and run the script as root.
 
-- **macOS / Linux**: `python3`, `curl`, and `openssl` on PATH
-- **Windows**: PowerShell 5.1 (ships with Windows 10+) or PowerShell 7+ (`pwsh`). The Windows path is implemented entirely in PowerShell — no `python3` or `curl` required. The `.cmd` file is a thin launcher that forwards to `configure_tools_windows.ps1`.
+**Where files live on the device**
 
-## Usage
+| What | Windows | macOS / Linux |
+| --- | --- | --- |
+| Certificate bundle (`netskope-cert-bundle.pem`) | `C:\netskope\` | `/usr/local/netskope/` |
+| Silent script | Anywhere: the GPO/Intune/Jamf package folder or share. It does not need to be installed. | Anywhere (the MDM package location) |
+| Bundle shipped with the script | **Same folder as the silent script**; the script copies it into the folder above | **Same folder as the silent script** |
+| Merged bundles (only if a user had a custom CA bundle) | `C:\netskope\merged\` | `/usr/local/netskope/merged/` |
+| macOS GUI env script | n/a | `/usr/local/netskope/netskope-gui-env.sh` |
+| Log | `C:\Users\Public\netskope-ssl-configure-tools.log` | macOS `/Users/Shared/…`, Linux `/var/tmp/…` |
 
-### macOS / Linux
+- **Windows:** `C:\netskope` is the same default as the interactive script. When run elevated, the script locks it to SYSTEM/Administrators full control and Users read-only.
+- **macOS/Linux:** the interactive script used `~/netskope` (per user). The silent script uses one shared `/usr/local/netskope` so a root-run MDM job serves every account.
+- **Do not deploy** `netskope-cert.pem` (the build input) or the `build_cert_bundle_*` scripts to devices; they stay on the admin machine. Only `netskope-cert-bundle.pem` and the `silent_configure_tools_*` script go out.
+- To re-run the script later (scheduled task, login script), put the script and the bundle together in a permanent folder, e.g. `C:\netskope\` itself. Running it from the bundle's own folder is supported.
+- Use `-CertDir` (Windows) or `-d` (macOS/Linux) to choose a different location.
 
-```bash
-chmod +x configure_tools_unix.sh
-./configure_tools_unix.sh
+**What gets configured**
+
+- **Environment variables — configured even for tools that aren't installed yet**, so they work if the tool is installed later: `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `AWS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `npm_config_cafile`, `YARN_HTTPS_CA_FILE_PATH`, `PIP_CERT`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, `OCI_CLI_CA_BUNDLE`, `CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE`, `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`, `COMPOSER_CAFILE`, `DENO_CERT`, `CONDA_SSL_VERIFY`, `NETSKOPE_CA_BUNDLE`. Together these cover Python (requests, pip, httpx, Poetry), Azure CLI, AWS CLI, Node.js/npm/Yarn/Bun/Deno, Claude CLI/Desktop, VS Code/Cursor, Git, Go, Ruby, Terraform, Cargo, gcloud, Oracle CLI, Composer, conda, cURL, OpenSSL and the Netskope CLI.
+  - Windows: machine-scope variables when elevated (user-scope otherwise).
+  - macOS/Linux: a marker-delimited managed block (`# >>> netskope-ssl-configure ... <<<`) in each user's shell rc files, replaced in place on re-runs, so existing content is never duplicated. On macOS a LaunchAgent (`com.netskope.ssl-trust-env`) also exports the variables to GUI apps at every login (Claude Desktop, VS Code launched from the Dock...), using each user's decided values from `~/.netskope/ssl-env`. On Linux a systemd `environment.d` file does the same for GUI sessions.
+- **File/directory-based config — only when the tool is present, otherwise skipped and logged:** the Git `http.sslCAInfo` setting in each user's `~/.gitconfig` (same rules as the variables below), and the Azure Storage Explorer `certs` directory (bundle copy).
+
+**Existing values are never overwritten blindly.** A developer may already point `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS` etc. at a custom bundle with internal/private CAs. Internal hosts are often not steered through Netskope, so replacing that bundle would break them. Each existing value is checked:
+
+| Existing value | Action | Log |
+| --- | --- | --- |
+| unset, a missing file, or not a certificate file (e.g. `CONDA_SSL_VERIFY=false`) | set the Netskope bundle | `OK` |
+| already the Netskope bundle | leave | `SKIP` |
+| a previous Netskope bundle (path contains a `netskope` folder, or file named `netskope*` / `nscacert*` / `nstenantcert*`) | replace with the Netskope bundle | `OK` |
+| a custom bundle that **already contains** the Netskope CA | leave | `SKIP` |
+| a custom bundle **without** the Netskope CA | **merge**: write `merged-<hash>.pem` (the custom certs + the Netskope CA) and point the variable at it | `OK` |
+| a directory, an unreadable file, or (Unix) a shell expression such as `$(python -m certifi)` | leave | `WARN` |
+
+`-Force` / `-f` skips all of this and sets the Netskope bundle everywhere.
+
+How the pieces fit:
+
+- **Which certs count as "the Netskope CA"**: the build scripts write a `# netskope-cert-count: N` header; the first N certificates of the bundle are the Netskope CA. A bundle without the header (e.g. built by the interactive scripts) still deploys, but custom bundles are then left untouched (`WARN`) because there is nothing reliable to check or merge. Rebuild with `build_cert_bundle_*` to enable merging.
+- **Merged bundles stay current**: each one records its source (`# netskope-merged-from: <path>`) and is regenerated on every run, so a rotated Netskope CA or the developer's own edits to their custom bundle carry through. If the source file is deleted, the variable falls back to the Netskope bundle. One merged file is shared by all variables that point at the same source.
+- **Windows, elevated (GPO/Intune as SYSTEM)**: decides on the *machine* value, then loads every user profile's registry hive and checks *per-user* values of the same variables. A per-user value always beats the machine value at runtime, so leaving it unchecked would undo the deployment for that user. A stale per-user value is deleted when the machine value is correct (so future machine updates reach that user); a custom one is kept or merged as in the table. Per-user changes apply at that user's next logon. It also locks `C:\netskope` to SYSTEM/Administrators full control and Users read-only; by default, folders created under `C:\` let any authenticated user modify them, which would let one user swap the machine-wide trust bundle.
+- **Windows, normal user**: decides on the value the user actually gets (user scope, else machine scope) and writes only user scope. If GPO already set the machine value correctly and the user has no override, nothing changes.
+- **macOS/Linux**: the existing value is the user's own `export VAR=...` line in `.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`, `.bash_profile`, `.bash_login`, `.profile` or `.bashrc`. When the decision changes it (replace or merge), that line would still override the managed block (it loads later), so it is **commented out** with a dated `# [disabled by netskope-ssl-configure YYYY-MM-DD]` prefix after the file is backed up once to `<file>.netskope-bak`. Lines whose value is kept are not touched, and the variable is left out of the managed block. As root every local account is processed; as a normal user, a value inherited from elsewhere (system profile, `launchctl`) is checked too.
+
+**Log format** — one line per action, appended, rotated to `.old` at 2 MB. Each run writes:
+
+1. **A diagnostic header**: host, OS version, PowerShell/bash version, account and elevation, flags, script and log paths.
+2. **Bundle facts**: whether the shipped bundle was installed (first install / replaced, with SHA256 before → after) or was already identical; size, modification time and SHA256 of the deployed bundle; and for each Netskope CA certificate its subject, issuer, validity dates and SHA1 thumbprint. A `WARN` is logged when it is expired or expires within 30 days.
+3. **The accounts/profiles in scope**, the tools found on the process PATH (with their paths), and per-user registry hive state on Windows.
+4. **One line per decision**, always stating *what was found*, *where it was read from*, *why* it was kept or changed, and *the new value*:
+
+```
+[OK   ] Machine CURL_CA_BUNDLE: set to 'C:\netskope\netskope-cert-bundle.pem' - value is a previous Netskope bundle location (path contains a "netskope" folder); previous value 'C:\old\netskope\netskope-cert-bundle.pem' [cURL, Netskope CLI]
+[OK   ] Machine SSL_CERT_FILE: set to 'C:\netskope\merged\merged-77792eeb7f74.pem' - custom bundle with 2 certificate(s) includes only 0 of 1 Netskope CA certificate(s); merged into a new bundle (2 from the source + 1 Netskope CA certificate(s)) so its other CAs keep working; previous value 'D:\certs\corp.pem' [OpenSSL, ...]
+[SKIP ] Machine NODE_EXTRA_CA_CERTS: no change - value already points to the Netskope bundle: 'C:\netskope\netskope-cert-bundle.pem' [Node.js, ...]
+[SKIP ] Machine REQUESTS_CA_BUNDLE: no change - kept existing value 'D:\certs\corp-with-ns.pem' - custom bundle with 2 certificate(s) that already includes all 1 Netskope CA certificate(s) [Python Requests, ...]
+[SKIP ] Machine SSL_CERT_FILE: no change - merged bundle 'C:\netskope\merged\merged-77792eeb7f74.pem' is up to date with its source 'D:\certs\corp.pem' (2 from the source + 1 Netskope CA certificate(s)) [OpenSSL, ...]
+[OK   ] User[jdoe] AWS_CA_BUNDLE: per-user override removed so the Machine value 'C:\netskope\netskope-cert-bundle.pem' applies at next logon - file does not exist; previous value 'C:\old.pem' (read from HKU\S-1-5-21-...\Environment) [AWS CLI]
+[SKIP ] jdoe REQUESTS_CA_BUNDLE: no change - kept existing value '/Users/jdoe/corp.pem' (read from user's own line /Users/jdoe/.zshrc:12, written as '~/corp.pem') - custom bundle with ... [Python Requests, ...]
+[WARN ] jdoe PIP_CERT: no change - kept existing value '$(python -m certifi)' (read from user's own line /Users/jdoe/.bashrc:5) - it is a shell expression that cannot be evaluated safely; use -f to replace [pip]
+[OK   ] Commented out the user's own definitions of SSL_CERT_FILE (line 2), CURL_CA_BUNDLE (line 4) in /Users/jdoe/.bashrc - they load after the managed block and would override it (backup: /Users/jdoe/.bashrc.netskope-bak)
+[SKIP ] Azure Storage Explorer: no change - C:\Users\jdoe\...\certs\netskope-cert-bundle.pem is identical to the bundle (SHA256 09557C357811A656...)
 ```
 
-### Windows
+5. **A closing summary**: `Summary: 7 changed (OK), 16 unchanged (SKIP), 2 warning(s), 0 error(s) in 2.1s`.
 
-```cmd
-configure_tools_windows.cmd
-```
+Levels: `INFO` (context), `OK` (changed something), `SKIP` (nothing to change: already configured, value kept on purpose, or tool not installed), `WARN` (needs attention), `ERROR` (a step failed). Value sources you may see after "read from": a scope (`User scope`, `Machine scope; no User value`), a registry key (`HKU\<SID>\Environment`, with the raw `%USERPROFILE%` form if it differs), a file and line (`user's own line ~/.zshrc:12`), `managed block from a previous run`, or `inherited environment`.
 
-### Prompts
+**Exit codes** — `0` done (skips are not errors) · `2` done but at least one step failed (see `ERROR` lines) · `1` fatal (e.g. bundle missing or invalid).
 
-Each script asks for:
+**Troubleshooting**
 
-- **Tenant name** — e.g. `tenant-name.goskope.com`
-- **Bundle filename** — default `netskope-cert-bundle.pem`
-- **Bundle directory** — default `~/netskope` (Unix) or `C:\netskope` (Windows)
-- **API Bearer token** — skipped if a local Netskope STAgent install is detected and accepted, or if `NETSKOPE_API_TOKEN` is set in the environment
+- Read the log first; every run starts with a `start` line and the diagnostic header, and ends with a `Summary` and a `finished` line. `grep " SSL_CERT_FILE"` (or `Select-String`) across the log shows that variable's history across runs.
+- Compare the bundle SHA256 and Netskope CA thumbprint in the header with the bundle you built to confirm which bundle an endpoint actually has.
+- Env changes reach **new** processes/logins only; restart running terminals and apps.
+- A tool still fails for one user? Search the log for that user and variable: `kept` lines (`SKIP`/`WARN`) show values left alone on purpose. `WARN` cases (directory, shell expression, missing bundle header) need a manual look, or a run with `-Force` / `-f`.
+- Windows per-user values are checked only for profiles whose registry hive could be loaded; a `could not load registry hive` warning means that user was logged on in a way that locked it. The next run will retry.
+- Undo a commented-out rc line on macOS/Linux: restore `<file>.netskope-bak`, or delete the `# [disabled by netskope-ssl-configure ...]` prefix.
+- Under SYSTEM/root, the "Tools on PATH" log line only reflects the service account's PATH; it doesn't prove a tool is missing from a user's profile. Environment variables are set either way.
+- Not covered by these scripts: Docker (use the interactive scripts' `docker/` assets), Java keystores, and VS Code `settings.json` edits (the inherited `NODE_EXTRA_CA_CERTS` makes them unnecessary).
 
-### Silent re-deployment
+## Original interactive scripts
 
-Each run emits a replay script next to the bundle:
+The interactive tooling this fork started from is still in the repository: [configure_tools_unix.sh](configure_tools_unix.sh), [configure_tools_windows.cmd](configure_tools_windows.cmd) / [configure_tools_windows.ps1](configure_tools_windows.ps1) and [universal_configure_tools.py](universal_configure_tools.py). They prompt for the tenant, fetch the CA from the Netskope API or local client, and configure the invoking user, including generating Docker container assets. Their documentation (usage, tools configured, Docker, notes) is in the [README as of that version](https://github.com/Base4Security/netskope-ssl-configure-script/blob/60e8f5a/README.md).
 
-- **macOS / Linux**: `source <certDir>/configured_tools.sh` — must be sourced so `export` lines persist.
-- **Windows**: run `<certDir>\configured_tools.ps1` — re-invokes `configure_tools_windows.ps1` with `-NonInteractive` against the existing bundle (no tenant prompt, no API token required). The main `.ps1` is copied next to the bundle so the deploy folder is self-contained; copy the bundle, `configure_tools_windows.ps1`, and `configured_tools.ps1` to another machine and run the replay script.
-
-Copy the bundle and the replay script to another machine to reproduce the same configuration without re-prompting.
-
-## Tools configured
-
-Where a tool honors an environment variable, the script exports it in the user's shell config (`~/.bash_profile`, `~/.bashrc`, `~/.zshenv`) or via `setx` on Windows. Where the tool has a native config command, the script runs it directly.
-
-| Tool | How it's configured |
-| --- | --- |
-| Git | `git config --global http.sslCAInfo` (Windows) / `GIT_SSL_CAINFO` env var (Unix) |
-| OpenSSL | `SSL_CERT_FILE` env var |
-| cURL | `CURL_CA_BUNDLE` env var |
-| Python Requests / Azure CLI | `REQUESTS_CA_BUNDLE` env var |
-| Python pip | `PIP_CERT` env var |
-| AWS CLI | `AWS_CA_BUNDLE` env var |
-| Google Cloud CLI | `gcloud config set core/custom_ca_certs_file` |
-| Node.js | `NODE_EXTRA_CA_CERTS` env var |
-| npm | `npm config set cafile` |
-| Yarn | `yarn config set httpsCaFilePath` |
-| Claude CLI | `NODE_EXTRA_CA_CERTS` env var |
-| Netskope CLI (`ntsk` / `netskope`) | `NETSKOPE_CA_BUNDLE` + `SSL_CERT_FILE` + `REQUESTS_CA_BUNDLE` + `CURL_CA_BUNDLE` env vars (ntsk hits raw ssl/urllib paths, so all four are needed when openssl/curl/python aren't on PATH) |
-| Ruby | `SSL_CERT_FILE` env var |
-| PHP Composer | `composer config --global cafile` |
-| Oracle Cloud CLI | `OCI_CLI_CA_BUNDLE` env var |
-| Cargo (Rust) | `CARGO_HTTP_CAINFO` env var |
-| Azure Storage Explorer | Copies bundle into the app's `certs/` directory |
-| Claude Desktop | Detect-only — Electron reads `NODE_EXTRA_CA_CERTS` from the user environment at launch (set by `setx` on Windows; macOS GUI apps may need `launchctl setenv`) |
-| VS Code / VS Code Insiders / Cursor | Adds `NODE_EXTRA_CA_CERTS` to `terminal.integrated.env.*` in `settings.json` |
-| Docker | Generates container CA assets in `<certDir>/docker/` and can patch running containers (see [Docker](#docker)) |
-
-Note: Go (`crypto/x509`) picks up `SSL_CERT_FILE` automatically — it's already set by the OpenSSL entry, so there's no separate Go step.
-
-## Docker
-
-Containers ship their own trust store, so none of the host configuration above reaches them — a container behind SSL inspection fails every HTTPS call until the Netskope CA is installed *inside* it. When `docker` is on PATH, each script writes a self-contained `<certDir>/docker/` directory:
-
-| File | Use |
-| --- | --- |
-| `netskope-ca.crt` | The Netskope CA chain only (no Mozilla roots) — must be in the build context |
-| `Dockerfile.snippet` | Lines to paste into an existing Dockerfile |
-| `Dockerfile.example` | Standalone Debian/Ubuntu image that trusts the CA |
-| `Dockerfile.build-arg` | Installs the CA only when built with `--build-arg BUILD_ENV=development` |
-| `docker-compose.netskope.yml` + `netskope.env` | Compose wiring for the build-arg variant |
-| `install-netskope-ca-in-container.sh` / `.ps1` | Patches containers that are already running |
-| `trust-netskope-ca-in-docker-daemon.sh` | Makes the Docker **daemon** trust the CA (pulls, pushes, builds) |
-| `README.md` | The same guidance, next to the files |
-
-The script also offers to run the injector against the containers running at that moment.
-
-### Two separate problems
-
-The daemon and the containers fail independently, and fixing one does not fix the other:
-
-- **The daemon** does its own TLS to the registry, so `docker pull` can fail with `x509: certificate signed by unknown authority` before any container exists. `trust-netskope-ca-in-docker-daemon.sh` (Linux, needs `sudo`) fixes this two ways: with no arguments it installs into the host OS trust store, which covers every registry including Docker Hub but needs a daemon restart; given registry names it writes `/etc/docker/certs.d/<registry>/ca.crt`, which takes effect on the next pull with no restart but only for those registries. Docker Desktop on macOS/Windows uses neither path — add the CA to the host keychain or Windows certificate store and restart Docker Desktop.
-- **The containers** need the CA in their own trust store, which is what the Dockerfile assets and the injector handle.
-
-- **Baking beats patching.** `docker cp` into a running container is undone the moment the container is recreated; the Dockerfile route survives.
-- **Trust-store layout is detected per container** — `/usr/local/share/ca-certificates` + `update-ca-certificates` (Debian/Ubuntu/Alpine), `/etc/pki/ca-trust/source/anchors` + `update-ca-trust` (RHEL family), or `/etc/pki/trust/anchors` (SUSE). Minimal images that ship the merged bundle but no `update-ca-certificates` (most Alpine-based ones) get the CA appended to `/etc/ssl/certs/ca-certificates.crt` instead, marked so re-runs are idempotent.
-- **The OS trust store is not sufficient on its own.** Node, Python `requests`, pip, Cargo and Git each carry their own CA list, so the generated Dockerfiles also set `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `GIT_SSL_CAINFO` and `CARGO_HTTP_CAINFO`. (Verified: Node rejects a Netskope-signed cert with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` even after `update-ca-certificates`, and accepts it once `NODE_EXTRA_CA_CERTS` is set.)
-- **`.crt`, not `.pem`** — `update-ca-certificates` only picks up files with a `.crt` extension, which is why the container copy is named `netskope-ca.crt`.
-- Generated assets are ASCII with LF line endings and no BOM, so they work unchanged when the bundle is produced on Windows and consumed in a Linux container.
-
-## Notes
-
-- **New shells only** — `setx` (Windows) and shell-config exports take effect in new terminal sessions, not the one that ran the script.
-- **Restart GUI apps** — Claude Desktop, VS Code variants, and Azure Storage Explorer need to be restarted after configuration.
-- **Backup on edit** — JSON configs (VS Code variants) are backed up to `<file>.backup` during the edit and restored automatically if the patch fails. The JSONC parser is string-aware on **read** (it won't choke on `//` inside `https://` URLs), but the **write** is a plain JSON re-serialization — any `//` or `/* */` comments in your `settings.json` are not preserved. The scripts print a warning when they drop comments.
-- **Trust-store download is verified first** — the Mozilla root bundle (`curl.se/ca/cacert.pem`) is fetched with TLS verification enabled and only falls back to an unverified fetch if that fails (i.e. when the host is behind Netskope inspection and the resigned cert isn't trusted yet). A size sanity-check rejects truncated/captive-portal responses before they reach the bundle.
-- **API token stays off the process table** — the Unix script passes the Bearer token to `curl` via a mode-600 `--config` file rather than on the command line, so it isn't visible in `ps` on multi-user hosts.
-- **`REQUESTS_CA_BUNDLE` is shared** — Python Requests and Azure CLI both read it, so setting it once configures both.
-
-### Python (any platform)
-
-```bash
-python3 universal_configure_tools.py
-```
-
-Stdlib only — no `pip install` needed.
-
-## Other files
-
-- [check_ssl.js](check_ssl.js) — Node.js probe for verifying a TLS endpoint after configuration. Prints the presented certificate chain (leaf → root) and whether Node's active trust store (system roots + `NODE_EXTRA_CA_CERTS`) validated it. Usage: `node check_ssl.js [host[:port]] [path]` — exits non-zero if the chain didn't validate.
+[check_ssl.js](check_ssl.js) is a Node.js probe to verify a TLS endpoint after configuration: it prints the presented certificate chain and whether Node's trust store (system roots + `NODE_EXTRA_CA_CERTS`) validated it. Usage: `node check_ssl.js [host[:port]] [path]`.
