@@ -92,7 +92,9 @@ try {
     if (-not (Test-Path -LiteralPath $inputPath)) { throw "Input certificate not found: $inputPath" }
 
     Write-Host "Reading Netskope CA: $inputPath"
-    $nsBlocks = Get-PemBlocks $inputPath 'Netskope certificate file'
+    # @() keeps a single result an array (PowerShell unrolls 1-element arrays on return,
+    # and string + array would then concatenate the blocks onto one line).
+    $nsBlocks = @(Get-PemBlocks $inputPath 'Netskope certificate file')
     Write-Host "  $($nsBlocks.Count) certificate(s)"
 
     $mozTemp = $null
@@ -107,7 +109,7 @@ try {
     }
 
     try {
-        $mozBlocks = Get-PemBlocks $mozSource 'Mozilla bundle'
+        $mozBlocks = @(Get-PemBlocks $mozSource 'Mozilla bundle')
         if ($mozBlocks.Count -lt $MozillaMinCerts) {
             throw "Mozilla bundle has only $($mozBlocks.Count) certificates (expected >= $MozillaMinCerts)"
         }
