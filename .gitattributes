@@ -1,0 +1,11 @@
+# Line endings. Scripts that run on macOS/Linux must keep LF even when the repo is cloned on
+# Windows with core.autocrlf=true: a CRLF shebang ("#!/bin/bash\r") or "\r" at the end of
+# shell lines breaks them when the files are copied to a Mac or Linux box.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.js text eol=lf
+
+# Windows batch files need CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf

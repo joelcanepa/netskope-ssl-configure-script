@@ -8,14 +8,14 @@ Scripts that make developer CLIs, libraries and desktop apps trust the Netskope 
 
 ## What this fork adds
 
-- **Works when the tenant CA can't be fetched automatically.** The interactive scripts read the CA from the local Netskope client or download it from the tenant, which fails with *Protect Client Configuration and Resources* or Secure Configuration Services. The new build scripts take a `netskope-cert.pem` you supply.
+- **Works when the tenant CA can't be fetched automatically.** The interactive scripts read the CA from the local Netskope client or download it from the tenant, which fails with *Protect Client Configuration and Resources* or Secure Configuration Services. The new build scripts take the tenant certificates you download (root, intermediate and remote users) and check that they belong together.
 - **Silent, non-interactive configuration** for GPO / MDM rollout (Windows PowerShell, macOS/Linux bash): no prompts, no API token, runs as SYSTEM/root or as a normal user.
 - **Machine-wide and per-user coverage** when run elevated: machine-scope variables and every user profile on Windows; every local account's shell files on macOS/Linux, plus a LaunchAgent (macOS) / `environment.d` (Linux) so GUI apps get the variables too.
 - **Configures tools that aren't installed yet.** Environment variables are set for 17 variables covering Python, Azure CLI, AWS CLI, Node.js/npm/Yarn, Git, Go, Ruby, Cargo, gcloud, conda and more, so they work if a tool is installed later. File-based config (Git, Azure Storage Explorer) is skipped and logged when the tool is missing.
 - **Never overwrites existing values blindly.** Custom CA bundles that already trust Netskope are kept; custom bundles that don't are merged with the Netskope CA so internal CAs keep working; stale or previous Netskope paths are replaced. `-Force` / `-f` overrides this.
 - **Detailed troubleshooting log**: timestamped, with the current value, where it was read from, why each setting was kept or changed, bundle hashes, Netskope CA identity and expiry, and a closing summary.
 - **Dry-run mode** (`-DryRun` / `-x`) and meaningful exit codes for MDM reporting.
-- **Hardened bundle build**: validates every certificate, normalises line endings, writes atomically, supports offline builds.
+- **Hardened bundle build**: validates every certificate, checks that the intermediate is signed by the root and that nothing is expired, swapped or duplicated, normalises line endings, writes atomically, supports offline builds.
 
 ## Silent deployment (GPO / MDM)
 
@@ -28,14 +28,40 @@ For mass deployment where the tenant CA can't be read from the client or downloa
 
 ### Step 1 — build `netskope-cert-bundle.pem`
 
-1. Obtain the Netskope tenant CA yourself and save it as `netskope-cert.pem` **in the same directory as the build script**.
-Note: to obtain the certificate go in your tenant to: Settings -> Manage -> Certificates -> Netskope Certificates and download the Netskope Root Certificate (Remote Users).
+1. In the tenant, go to **Settings → Manage → Certificates → Netskope Certificates** and download the three certificates. Save them **in the same directory as the build script** with these names:
+
+   | Save as | Tenant download | Required |
+   | --- | --- | --- |
+   | `netskope-root-ca.pem` | Netskope root certificate | **Yes**: this CA signs the traffic inspected by the Netskope Client |
+   | `netskope-intermediate-ca.pem` | Netskope intermediate certificate | Recommended (warning if missing) |
+   | `netskope-remote-users-ca.pem` | Netskope root certificate (remote users) | Recommended (warning if missing) |
+
+   > The **remote users** certificate on its own is **not** enough: traffic through the Netskope Client is signed by the tenant root → intermediate chain, so tools would still fail with `self signed certificate in certificate chain`. Older versions of this README asked only for that certificate (as `netskope-cert.pem`); the build scripts now stop with a migration message if they find only that file.
+
 2. Run the build script (no arguments needed):
    - Windows: `powershell -ExecutionPolicy Bypass -File .\build_cert_bundle_windows.ps1`
    - macOS/Linux: `./build_cert_bundle_unix.sh`
-3. `netskope-cert-bundle.pem` appears next to it: the Netskope cert(s) first, then the Mozilla root bundle from `curl.se`. Input is validated (every block must parse as a certificate), line endings are normalised, and the output is written atomically.
+3. `netskope-cert-bundle.pem` appears next to it: the Netskope certificates first (root, intermediate, remote users), then the Mozilla root bundle from `curl.se`. The header records which ones were included (`# netskope-certs: root, intermediate, remote-users`) and how many (`# netskope-cert-count: 3`).
 
-Offline packaging: pass a local copy of Mozilla's `cacert.pem` (`-MozillaBundlePath` on Windows, `-m` on Unix). Other options: `-Dir`/`-d`, `-InputName`/`-i`, `-OutputName`/`-o`.
+Before writing anything, the build checks the inputs, so a wrong or swapped file fails on the admin machine instead of on the endpoints:
+
+- each file holds exactly one valid certificate
+- the root and remote-users certificates are self-signed
+- the intermediate is **signed by** the root (signature checked, not just the name: every tenant's root is named `CN=certadmin`, so a root from another tenant would pass a name check)
+- no certificate is expired (warning if it expires within 90 days)
+- no certificate appears under two names
+
+Line endings are normalised and the output is written atomically.
+
+Offline packaging: pass a local copy of Mozilla's `cacert.pem` (`-MozillaBundlePath` on Windows, `-m` on Unix). Other options:
+
+| | Windows | macOS / Linux |
+| --- | --- | --- |
+| Input/output directory | `-Dir` | `-d` |
+| Root CA filename | `-RootName` | `-r` |
+| Intermediate CA filename | `-IntermediateName` | `-t` |
+| Remote-users CA filename | `-RemoteUsersName` | `-u` |
+| Output filename | `-OutputName` | `-o` |
 
 ### Step 2 — deploy and configure
 
@@ -71,7 +97,7 @@ Deployment examples:
 
 - **Windows:** `C:\netskope` is the same default as the interactive script. When run elevated, the script locks it to SYSTEM/Administrators full control and Users read-only.
 - **macOS/Linux:** the interactive script used `~/netskope` (per user). The silent script uses one shared `/usr/local/netskope` so a root-run MDM job serves every account.
-- **Do not deploy** `netskope-cert.pem` (the build input) or the `build_cert_bundle_*` scripts to devices; they stay on the admin machine. Only `netskope-cert-bundle.pem` and the `silent_configure_tools_*` script go out.
+- **Do not deploy** the build inputs (`netskope-root-ca.pem`, `netskope-intermediate-ca.pem`, `netskope-remote-users-ca.pem`) or the `build_cert_bundle_*` scripts to devices; they stay on the admin machine. Only `netskope-cert-bundle.pem` and the `silent_configure_tools_*` script go out.
 - To re-run the script later (scheduled task, login script), put the script and the bundle together in a permanent folder, e.g. `C:\netskope\` itself. Running it from the bundle's own folder is supported.
 - Use `-CertDir` (Windows) or `-d` (macOS/Linux) to choose a different location.
 
